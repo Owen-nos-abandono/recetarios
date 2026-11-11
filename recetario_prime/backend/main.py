@@ -1,164 +1,636 @@
+
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
+
 import jwt
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pwdlib import PasswordHash
-from pydantic import BaseModel, EmailStr, Field, ConfigDict
-from sqlalchemy import create_engine, String, Integer, Boolean, Text, ForeignKey, DateTime, or_
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker, Session
+from pydantic import BaseModel, Field, ConfigDict
+from sqlalchemy import (
+    create_engine, String, Integer, Boolean, Text,
+    ForeignKey, DateTime, or_
+)
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import (
+    DeclarativeBase, Mapped, mapped_column,
+    relationship, sessionmaker, Session
+)
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
 
 load_dotenv()
-DB_URL=os.getenv("DATABASE_URL","sqlite:///./recetario.db")
-SECRET=os.getenv("JWT_SECRET_KEY","replace-this-secret")
-ADMIN_EMAIL=os.getenv("ADMIN_EMAIL","admin@recetario.local").lower()
-ADMIN_PASSWORD=os.getenv("ADMIN_PASSWORD","ChangeMe123!")
-ORIGINS=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:4200").split(",")]
-engine=create_engine(DB_URL,connect_args={"check_same_thread":False} if DB_URL.startswith("sqlite") else {},pool_pre_ping=True)
-SessionLocal=sessionmaker(bind=engine,autoflush=False,autocommit=False)
-hasher=PasswordHash.recommended()
-bearer=HTTPBearer(auto_error=False)
 
-class Base(DeclarativeBase): pass
+IS_VERCEL = os.getenv("VERCEL") == "1"
+
+DB_URL = os.getenv("DATABASE_URL", "sqlite:///./recetario.db")
+SECRET = os.getenv("JWT_SECRET_KEY", "local-development-secret-change-me")
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@recetario.local").lower()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "ChangeMe123!")
+
+JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "720"))
+
+ORIGINS = [
+    x.strip().rstrip("/")
+    for x in os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:4200"
+    ).split(",")
+    if x.strip()
+]
+
+if IS_VERCEL:
+    if SECRET == "local-development-secret-change-me":
+        raise RuntimeError("Configura JWT_SECRET_KEY en Vercel.")
+
+    if ADMIN_PASSWORD == "ChangeMe123!":
+        raise RuntimeError("Configura ADMIN_PASSWORD en Vercel.")
+
+    if len(SECRET) < 32:
+        raise RuntimeError("JWT_SECRET_KEY debe tener al menos 32 caracteres.")
+
+
+# ============================================================
+# CONEXIÓN POSTGRESQL / SQLITE
+# ============================================================
+
+def normalize_database_url(url: str) -> str:
+    """
+    Convierte las URLs PostgreSQL de Neon al controlador
+    Psycopg 3 utilizado por SQLAlchemy.
+    """
+
+    if url.startswith("postgres://"):
+        url = "postgresql://" + url[len("postgres://"):]
+
+    if url.startswith("postgresql://"):
+        url = "postgresql+psycopg://" + url[len("postgresql://"):]
+
+    return url
+
+
+DB_URL = normalize_database_url(DB_URL)
+
+if DB_URL.startswith("sqlite"):
+    engine = create_engine(
+        DB_URL,
+        connect_args={"check_same_thread": False},
+        pool_pre_ping=True
+    )
+else:
+    from sqlalchemy.pool import NullPool
+
+    engine = create_engine(
+        DB_URL,
+        pool_pre_ping=True,
+        poolclass=NullPool
+    )
+
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    autocommit=False
+)
+
+
+# ============================================================
+# SEGURIDAD
+# ============================================================
+
+hasher = PasswordHash.recommended()
+bearer = HTTPBearer(auto_error=False)
+
+
+# ============================================================
+# MODELOS
+# ============================================================
+
+class Base(DeclarativeBase):
+    pass
+
+
 class User(Base):
-    __tablename__="users"
-    id:Mapped[int]=mapped_column(primary_key=True)
-    name:Mapped[str]=mapped_column(String(120))
-    email:Mapped[str]=mapped_column(String(180),unique=True,index=True)
-    password_hash:Mapped[str]=mapped_column(String(500))
-    role:Mapped[str]=mapped_column(String(20),default="user")
-    active:Mapped[bool]=mapped_column(Boolean,default=True)
-    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc))
-    recipes:Mapped[list["Recipe"]]=relationship(back_populates="owner",cascade="all, delete-orphan")
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    name: Mapped[str] = mapped_column(String(120))
+
+    email: Mapped[str] = mapped_column(
+        String(180),
+        unique=True,
+        index=True
+    )
+
+    password_hash: Mapped[str] = mapped_column(String(500))
+
+    role: Mapped[str] = mapped_column(String(20), default="user")
+
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc)
+    )
+
+    recipes: Mapped[list["Recipe"]] = relationship(
+        back_populates="owner",
+        cascade="all, delete-orphan"
+    )
+
+
 class Recipe(Base):
-    __tablename__="recipes"
-    id:Mapped[int]=mapped_column(primary_key=True)
-    title:Mapped[str]=mapped_column(String(180))
-    description:Mapped[Optional[str]]=mapped_column(Text,nullable=True)
-    ingredients:Mapped[str]=mapped_column(Text,default="")
-    instructions:Mapped[str]=mapped_column(Text,default="")
-    category:Mapped[str]=mapped_column(String(80),default="General")
-    prep_time:Mapped[Optional[int]]=mapped_column(Integer,nullable=True)
-    servings:Mapped[Optional[int]]=mapped_column(Integer,nullable=True)
-    image_url:Mapped[Optional[str]]=mapped_column(String(1000),nullable=True)
-    created_by:Mapped[int]=mapped_column(ForeignKey("users.id"))
-    created_at:Mapped[datetime]=mapped_column(DateTime(timezone=True),default=lambda:datetime.now(timezone.utc))
-    owner:Mapped[User]=relationship(back_populates="recipes")
+    __tablename__ = "recipes"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+
+    title: Mapped[str] = mapped_column(String(180))
+
+    description: Mapped[Optional[str]] = mapped_column(
+        Text,
+        nullable=True
+    )
+
+    ingredients: Mapped[str] = mapped_column(Text, default="")
+
+    instructions: Mapped[str] = mapped_column(Text, default="")
+
+    category: Mapped[str] = mapped_column(
+        String(80),
+        default="General"
+    )
+
+    prep_time: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        nullable=True
+    )
+
+    servings: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        nullable=True
+    )
+
+    image_url: Mapped[Optional[str]] = mapped_column(
+        String(1000),
+        nullable=True
+    )
+
+    created_by: Mapped[int] = mapped_column(
+        ForeignKey("users.id")
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc)
+    )
+
+    owner: Mapped[User] = relationship(
+        back_populates="recipes"
+    )
+
+
+# ============================================================
+# ESQUEMAS
+# ============================================================
 
 class Login(BaseModel):
     email: str
-    password:str
+    password: str
+
+
 class UserCreate(BaseModel):
-    name:str=Field(min_length=2,max_length=120)
+    name: str = Field(min_length=2, max_length=120)
     email: str
-    password:str=Field(min_length=8,max_length=128)
-    role:str="user"
+    password: str = Field(min_length=8, max_length=128)
+    role: str = "user"
+
+
 class UserPatch(BaseModel):
-    name:Optional[str]=None
-    email:Optional[str]=None
-    password:Optional[str]=None
-    role:Optional[str]=None
-    active:Optional[bool]=None
+    name: Optional[str] = Field(default=None, min_length=2, max_length=120)
+    email: Optional[str] = None
+    password: Optional[str] = Field(default=None, min_length=8, max_length=128)
+    role: Optional[str] = None
+    active: Optional[bool] = None
+
+
 class RecipeIn(BaseModel):
-    title:str=Field(min_length=2,max_length=180)
-    description:Optional[str]=None
-    ingredients:str=""
-    instructions:str=""
-    category:str="General"
-    prep_time:Optional[int]=None
-    servings:Optional[int]=None
-    image_url:Optional[str]=None
+    title: str = Field(min_length=2, max_length=180)
+    description: Optional[str] = None
+    ingredients: str = ""
+    instructions: str = ""
+    category: str = "General"
+    prep_time: Optional[int] = None
+    servings: Optional[int] = None
+    image_url: Optional[str] = None
+
+
 class UserOut(BaseModel):
-    model_config=ConfigDict(from_attributes=True)
-    id:int; name:str; email:str; role:str; active:bool; created_at:datetime
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    email: str
+    role: str
+    active: bool
+    created_at: datetime
+
+
+# ============================================================
+# SESIONES DE BASE DE DATOS
+# ============================================================
 
 def db_session():
-    db=SessionLocal()
-    try: yield db
-    finally: db.close()
-def auth(creds:Optional[HTTPAuthorizationCredentials]=Depends(bearer),db:Session=Depends(db_session)):
-    if not creds: raise HTTPException(401,"Inicia sesión para continuar.")
-    try: uid=int(jwt.decode(creds.credentials,SECRET,algorithms=["HS256"])["sub"])
-    except Exception: raise HTTPException(401,"Sesión inválida o vencida.")
-    u=db.get(User,uid)
-    if not u or not u.active: raise HTTPException(401,"Cuenta inexistente o desactivada.")
-    return u
-def admin(u:User=Depends(auth)):
-    if u.role!="admin": raise HTTPException(403,"Acción exclusiva del administrador.")
-    return u
-def token(u):
-    now=datetime.now(timezone.utc)
-    return jwt.encode({"sub":str(u.id),"iat":now,"exp":now+timedelta(minutes=int(os.getenv("JWT_EXPIRE_MINUTES","720")))},SECRET,algorithm="HS256")
-def recipe_json(r):
-    return {"id":r.id,"title":r.title,"description":r.description,"ingredients":r.ingredients,"instructions":r.instructions,"category":r.category,"prep_time":r.prep_time,"servings":r.servings,"image_url":r.image_url,"created_by":r.created_by,"creator_name":r.owner.name,"created_at":r.created_at}
+    db = SessionLocal()
 
-app=FastAPI(title="Mi Recetario API")
-app.add_middleware(CORSMiddleware,allow_origins=ORIGINS,allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# ============================================================
+# AUTENTICACIÓN
+# ============================================================
+
+def auth(
+    creds: Optional[HTTPAuthorizationCredentials] = Depends(bearer),
+    db: Session = Depends(db_session)
+):
+    if not creds:
+        raise HTTPException(
+            status_code=401,
+            detail="Inicia sesión para continuar."
+        )
+
+    try:
+        payload = jwt.decode(
+            creds.credentials,
+            SECRET,
+            algorithms=["HS256"]
+        )
+
+        uid = int(payload["sub"])
+
+    except Exception:
+        raise HTTPException(
+            status_code=401,
+            detail="Sesión inválida o vencida."
+        )
+
+    user = db.get(User, uid)
+
+    if not user or not user.active:
+        raise HTTPException(
+            status_code=401,
+            detail="Cuenta inexistente o desactivada."
+        )
+
+    return user
+
+
+def admin(user: User = Depends(auth)):
+    if user.role != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Acción exclusiva del administrador."
+        )
+
+    return user
+
+
+def token(user):
+    now = datetime.now(timezone.utc)
+
+    return jwt.encode(
+        {
+            "sub": str(user.id),
+            "iat": now,
+            "exp": now + timedelta(minutes=JWT_EXPIRE_MINUTES)
+        },
+        SECRET,
+        algorithm="HS256"
+    )
+
+
+# ============================================================
+# CONVERSIÓN DE RECETAS
+# ============================================================
+
+def recipe_json(recipe):
+    return {
+        "id": recipe.id,
+        "title": recipe.title,
+        "description": recipe.description,
+        "ingredients": recipe.ingredients,
+        "instructions": recipe.instructions,
+        "category": recipe.category,
+        "prep_time": recipe.prep_time,
+        "servings": recipe.servings,
+        "image_url": recipe.image_url,
+        "created_by": recipe.created_by,
+        "creator_name": recipe.owner.name,
+        "created_at": recipe.created_at
+    }
+
+
+# ============================================================
+# INICIALIZACIÓN DE LA BASE DE DATOS
+# ============================================================
+
+def initialize_database():
+    Base.metadata.create_all(bind=engine)
+
+    with SessionLocal() as db:
+        existing = db.query(User).filter(
+            User.email == ADMIN_EMAIL
+        ).first()
+
+        if not existing:
+            administrator = User(
+                name="Administrador",
+                email=ADMIN_EMAIL,
+                password_hash=hasher.hash(ADMIN_PASSWORD),
+                role="admin",
+                active=True
+            )
+
+            db.add(administrator)
+
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+
+
 @app.on_event("startup")
 def startup():
-    Base.metadata.create_all(engine)
-    with SessionLocal() as db:
-        if not db.query(User).filter(User.email==ADMIN_EMAIL).first():
-            db.add(User(name="Administrador",email=ADMIN_EMAIL,password_hash=hasher.hash(ADMIN_PASSWORD),role="admin",active=True)); db.commit()
+    initialize_database()
+
+
+# ============================================================
+# APLICACIÓN FASTAPI
+# ============================================================
+
+app = FastAPI(title="Mi Recetario API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
+
+
+# ============================================================
+# SALUD DEL SERVIDOR
+# ============================================================
+
 @app.get("/api/health")
-def health(): return {"status":"ok"}
+def health():
+    return {"status": "ok"}
+
+
+# ============================================================
+# AUTENTICACIÓN Y USUARIOS
+# ============================================================
+
 @app.post("/api/auth/login")
-def login(data:Login,db:Session=Depends(db_session)):
-    u=db.query(User).filter(User.email==data.email.lower()).first()
-    if not u or not u.active or not hasher.verify(data.password,u.password_hash): raise HTTPException(401,"Correo o contraseña incorrectos.")
-    return {"access_token":token(u),"token_type":"bearer","user":UserOut.model_validate(u)}
-@app.get("/api/auth/me",response_model=UserOut)
-def me(u:User=Depends(auth)): return u
-@app.get("/api/users",response_model=list[UserOut])
-def users(_:User=Depends(admin),db:Session=Depends(db_session)): return db.query(User).order_by(User.id.desc()).all()
-@app.post("/api/users",response_model=UserOut,status_code=201)
-def add_user(data:UserCreate,_:User=Depends(admin),db:Session=Depends(db_session)):
-    email=data.email.lower()
-    if db.query(User).filter(User.email==email).first(): raise HTTPException(409,"Ese correo ya existe.")
-    if data.role not in ("user","admin"): raise HTTPException(422,"Rol inválido.")
-    u=User(name=data.name,email=email,password_hash=hasher.hash(data.password),role=data.role); db.add(u); db.commit(); db.refresh(u); return u
-@app.patch("/api/users/{uid}",response_model=UserOut)
-def edit_user(uid:int,data:UserPatch,a:User=Depends(admin),db:Session=Depends(db_session)):
-    u=db.get(User,uid)
-    if not u: raise HTTPException(404,"Usuario no encontrado.")
-    d=data.model_dump(exclude_unset=True)
-    if "password" in d and d["password"]: u.password_hash=hasher.hash(d.pop("password"))
-    if "email" in d and d["email"]:
-        email=str(d["email"]).lower()
-        if db.query(User).filter(User.email==email,User.id!=uid).first(): raise HTTPException(409,"Correo ya registrado.")
-        d["email"]=email
-    if d.get("role") not in (None,"user","admin"): raise HTTPException(422,"Rol inválido.")
-    if uid==a.id and d.get("active") is False: raise HTTPException(400,"No puedes desactivar tu propia cuenta.")
-    for k,v in d.items(): setattr(u,k,v)
-    db.commit(); db.refresh(u); return u
+def login(data: Login, db: Session = Depends(db_session)):
+    user = db.query(User).filter(
+        User.email == data.email.lower()
+    ).first()
+
+    if (
+        not user
+        or not user.active
+        or not hasher.verify(data.password, user.password_hash)
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Correo o contraseña incorrectos."
+        )
+
+    return {
+        "access_token": token(user),
+        "token_type": "bearer",
+        "user": UserOut.model_validate(user)
+    }
+
+
+@app.get("/api/auth/me", response_model=UserOut)
+def me(user: User = Depends(auth)):
+    return user
+
+
+@app.get("/api/users", response_model=list[UserOut])
+def users(
+    _: User = Depends(admin),
+    db: Session = Depends(db_session)
+):
+    return db.query(User).order_by(User.id.desc()).all()
+
+
+@app.post("/api/users", response_model=UserOut, status_code=201)
+def add_user(
+    data: UserCreate,
+    _: User = Depends(admin),
+    db: Session = Depends(db_session)
+):
+    email = data.email.lower()
+
+    if db.query(User).filter(User.email == email).first():
+        raise HTTPException(409, "Ese correo ya existe.")
+
+    if data.role not in ("user", "admin"):
+        raise HTTPException(422, "Rol inválido.")
+
+    user = User(
+        name=data.name,
+        email=email,
+        password_hash=hasher.hash(data.password),
+        role=data.role
+    )
+
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
+    return user
+
+
+@app.patch("/api/users/{uid}", response_model=UserOut)
+def edit_user(
+    uid: int,
+    data: UserPatch,
+    a: User = Depends(admin),
+    db: Session = Depends(db_session)
+):
+    user = db.get(User, uid)
+
+    if not user:
+        raise HTTPException(404, "Usuario no encontrado.")
+
+    changes = data.model_dump(exclude_unset=True)
+
+    password = changes.pop("password", None)
+
+    if password:
+        user.password_hash = hasher.hash(password)
+
+    if changes.get("email"):
+        email = str(changes["email"]).lower()
+
+        duplicate = db.query(User).filter(
+            User.email == email,
+            User.id != uid
+        ).first()
+
+        if duplicate:
+            raise HTTPException(409, "Correo ya registrado.")
+
+        changes["email"] = email
+
+    if changes.get("role") not in (None, "user", "admin"):
+        raise HTTPException(422, "Rol inválido.")
+
+    if uid == a.id and changes.get("active") is False:
+        raise HTTPException(
+            400,
+            "No puedes desactivar tu propia cuenta."
+        )
+
+    for key, value in changes.items():
+        setattr(user, key, value)
+
+    db.commit()
+    db.refresh(user)
+
+    return user
+
+
 @app.delete("/api/users/{uid}")
-def remove_user(uid:int,a:User=Depends(admin),db:Session=Depends(db_session)):
-    u=db.get(User,uid)
-    if not u: raise HTTPException(404,"Usuario no encontrado.")
-    if uid==a.id: raise HTTPException(400,"No puedes eliminar tu propia cuenta.")
-    db.delete(u); db.commit(); return {"message":"Cuenta eliminada."}
+def remove_user(
+    uid: int,
+    a: User = Depends(admin),
+    db: Session = Depends(db_session)
+):
+    user = db.get(User, uid)
+
+    if not user:
+        raise HTTPException(404, "Usuario no encontrado.")
+
+    if uid == a.id:
+        raise HTTPException(
+            400,
+            "No puedes eliminar tu propia cuenta."
+        )
+
+    db.delete(user)
+    db.commit()
+
+    return {"message": "Cuenta eliminada."}
+
+
+# ============================================================
+# RECETAS
+# ============================================================
+
 @app.get("/api/recipes")
-def recipes(q:Optional[str]=None,category:Optional[str]=None,_:User=Depends(auth),db:Session=Depends(db_session)):
-    query=db.query(Recipe)
-    if q: query=query.filter(or_(Recipe.title.ilike(f"%{q}%"),Recipe.ingredients.ilike(f"%{q}%"),Recipe.description.ilike(f"%{q}%")))
-    if category and category!="Todas": query=query.filter(Recipe.category==category)
-    return [recipe_json(r) for r in query.order_by(Recipe.id.desc()).all()]
-@app.post("/api/recipes",status_code=201)
-def add_recipe(data:RecipeIn,u:User=Depends(auth),db:Session=Depends(db_session)):
-    r=Recipe(**data.model_dump(),created_by=u.id); db.add(r); db.commit(); db.refresh(r); return recipe_json(r)
+def recipes(
+    q: Optional[str] = None,
+    category: Optional[str] = None,
+    _: User = Depends(auth),
+    db: Session = Depends(db_session)
+):
+    query = db.query(Recipe)
+
+    if q:
+        query = query.filter(
+            or_(
+                Recipe.title.ilike(f"%{q}%"),
+                Recipe.ingredients.ilike(f"%{q}%"),
+                Recipe.description.ilike(f"%{q}%")
+            )
+        )
+
+    if category and category != "Todas":
+        query = query.filter(Recipe.category == category)
+
+    results = query.order_by(Recipe.id.desc()).all()
+
+    return [recipe_json(recipe) for recipe in results]
+
+
+@app.post("/api/recipes", status_code=201)
+def add_recipe(
+    data: RecipeIn,
+    user: User = Depends(auth),
+    db: Session = Depends(db_session)
+):
+    recipe = Recipe(
+        **data.model_dump(),
+        created_by=user.id
+    )
+
+    db.add(recipe)
+    db.commit()
+    db.refresh(recipe)
+
+    return recipe_json(recipe)
+
+
 @app.put("/api/recipes/{rid}")
-def edit_recipe(rid:int,data:RecipeIn,u:User=Depends(auth),db:Session=Depends(db_session)):
-    r=db.get(Recipe,rid)
-    if not r: raise HTTPException(404,"Receta no encontrada.")
-    if u.role!="admin" and r.created_by!=u.id: raise HTTPException(403,"Solo puedes editar tus propias recetas.")
-    for k,v in data.model_dump().items(): setattr(r,k,v)
-    db.commit(); db.refresh(r); return recipe_json(r)
+def edit_recipe(
+    rid: int,
+    data: RecipeIn,
+    user: User = Depends(auth),
+    db: Session = Depends(db_session)
+):
+    recipe = db.get(Recipe, rid)
+
+    if not recipe:
+        raise HTTPException(404, "Receta no encontrada.")
+
+    if user.role != "admin" and recipe.created_by != user.id:
+        raise HTTPException(
+            403,
+            "Solo puedes editar tus propias recetas."
+        )
+
+    for key, value in data.model_dump().items():
+        setattr(recipe, key, value)
+
+    db.commit()
+    db.refresh(recipe)
+
+    return recipe_json(recipe)
+
+
 @app.delete("/api/recipes/{rid}")
-def remove_recipe(rid:int,u:User=Depends(auth),db:Session=Depends(db_session)):
-    r=db.get(Recipe,rid)
-    if not r: raise HTTPException(404,"Receta no encontrada.")
-    if u.role!="admin" and r.created_by!=u.id: raise HTTPException(403,"Solo puedes eliminar tus propias recetas.")
-    db.delete(r); db.commit(); return {"message":"Receta eliminada."}
+def remove_recipe(
+    rid: int,
+    user: User = Depends(auth),
+    db: Session = Depends(db_session)
+):
+    recipe = db.get(Recipe, rid)
+
+    if not recipe:
+        raise HTTPException(404, "Receta no encontrada.")
+
+    if user.role != "admin" and recipe.created_by != user.id:
+        raise HTTPException(
+            403,
+            "Solo puedes eliminar tus propias recetas."
+        )
+
+    db.delete(recipe)
+    db.commit()
+
+    return {"message": "Receta eliminada."}
