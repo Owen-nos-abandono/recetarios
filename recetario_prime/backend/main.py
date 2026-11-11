@@ -1,8 +1,6 @@
-
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
-from urllib.parse import urlsplit, urlunsplit
 
 import jwt
 from dotenv import load_dotenv
@@ -12,13 +10,23 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pwdlib import PasswordHash
 from pydantic import BaseModel, Field, ConfigDict
 from sqlalchemy import (
-    create_engine, String, Integer, Boolean, Text,
-    ForeignKey, DateTime, or_
+    create_engine,
+    String,
+    Integer,
+    Boolean,
+    Text,
+    ForeignKey,
+    DateTime,
+    or_
 )
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import (
-    DeclarativeBase, Mapped, mapped_column,
-    relationship, sessionmaker, Session
+    DeclarativeBase,
+    Mapped,
+    mapped_column,
+    relationship,
+    sessionmaker,
+    Session
 )
 
 # ============================================================
@@ -30,22 +38,38 @@ load_dotenv()
 IS_VERCEL = os.getenv("VERCEL") == "1"
 
 DB_URL = os.getenv("DATABASE_URL", "sqlite:///./recetario.db")
-SECRET = os.getenv("JWT_SECRET_KEY", "local-development-secret-change-me")
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@recetario.local").lower()
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "ChangeMe123!")
+SECRET = os.getenv(
+    "JWT_SECRET_KEY",
+    "local-development-secret-change-me"
+)
 
-JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "720"))
+ADMIN_EMAIL = os.getenv(
+    "ADMIN_EMAIL",
+    "admin@recetario.local"
+).strip().lower()
+
+ADMIN_PASSWORD = os.getenv(
+    "ADMIN_PASSWORD",
+    "ChangeMe123!"
+)
+
+JWT_EXPIRE_MINUTES = int(
+    os.getenv("JWT_EXPIRE_MINUTES", "720")
+)
 
 ORIGINS = [
-    x.strip().rstrip("/")
-    for x in os.getenv(
+    origin.strip().rstrip("/")
+    for origin in os.getenv(
         "CORS_ORIGINS",
         "http://localhost:4200"
     ).split(",")
-    if x.strip()
+    if origin.strip()
 ]
 
 if IS_VERCEL:
+    if not os.getenv("DATABASE_URL"):
+        raise RuntimeError("Configura DATABASE_URL en Vercel.")
+
     if SECRET == "local-development-secret-change-me":
         raise RuntimeError("Configura JWT_SECRET_KEY en Vercel.")
 
@@ -53,7 +77,15 @@ if IS_VERCEL:
         raise RuntimeError("Configura ADMIN_PASSWORD en Vercel.")
 
     if len(SECRET) < 32:
-        raise RuntimeError("JWT_SECRET_KEY debe tener al menos 32 caracteres.")
+        raise RuntimeError(
+            "JWT_SECRET_KEY debe tener al menos 32 caracteres."
+        )
+
+    if not ADMIN_EMAIL:
+        raise RuntimeError("Configura ADMIN_EMAIL en Vercel.")
+
+    if not ADMIN_PASSWORD:
+        raise RuntimeError("Configura ADMIN_PASSWORD en Vercel.")
 
 
 # ============================================================
@@ -65,6 +97,11 @@ def normalize_database_url(url: str) -> str:
     Convierte las URLs PostgreSQL de Neon al controlador
     Psycopg 3 utilizado por SQLAlchemy.
     """
+
+    url = url.strip()
+
+    if not url:
+        raise RuntimeError("DATABASE_URL está vacío.")
 
     if url.startswith("postgres://"):
         url = "postgresql://" + url[len("postgres://"):]
@@ -91,6 +128,7 @@ else:
         pool_pre_ping=True,
         poolclass=NullPool
     )
+
 
 SessionLocal = sessionmaker(
     bind=engine,
@@ -130,9 +168,15 @@ class User(Base):
 
     password_hash: Mapped[str] = mapped_column(String(500))
 
-    role: Mapped[str] = mapped_column(String(20), default="user")
+    role: Mapped[str] = mapped_column(
+        String(20),
+        default="user"
+    )
 
-    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    active: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -157,9 +201,15 @@ class Recipe(Base):
         nullable=True
     )
 
-    ingredients: Mapped[str] = mapped_column(Text, default="")
+    ingredients: Mapped[str] = mapped_column(
+        Text,
+        default=""
+    )
 
-    instructions: Mapped[str] = mapped_column(Text, default="")
+    instructions: Mapped[str] = mapped_column(
+        Text,
+        default=""
+    )
 
     category: Mapped[str] = mapped_column(
         String(80),
@@ -212,9 +262,20 @@ class UserCreate(BaseModel):
 
 
 class UserPatch(BaseModel):
-    name: Optional[str] = Field(default=None, min_length=2, max_length=120)
+    name: Optional[str] = Field(
+        default=None,
+        min_length=2,
+        max_length=120
+    )
+
     email: Optional[str] = None
-    password: Optional[str] = Field(default=None, min_length=8, max_length=128)
+
+    password: Optional[str] = Field(
+        default=None,
+        min_length=8,
+        max_length=128
+    )
+
     role: Optional[str] = None
     active: Optional[bool] = None
 
@@ -311,7 +372,9 @@ def token(user):
         {
             "sub": str(user.id),
             "iat": now,
-            "exp": now + timedelta(minutes=JWT_EXPIRE_MINUTES)
+            "exp": now + timedelta(
+                minutes=JWT_EXPIRE_MINUTES
+            )
         },
         SECRET,
         algorithm="HS256"
@@ -337,6 +400,25 @@ def recipe_json(recipe):
         "creator_name": recipe.owner.name,
         "created_at": recipe.created_at
     }
+
+
+# ============================================================
+# APLICACIÓN FASTAPI
+# IMPORTANTE: DEBE ESTAR ANTES DE LAS RUTAS Y STARTUP
+# ============================================================
+
+app = FastAPI(
+    title="Mi Recetario API",
+    version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
 
 # ============================================================
@@ -374,23 +456,16 @@ def startup():
 
 
 # ============================================================
-# APLICACIÓN FASTAPI
-# ============================================================
-
-app = FastAPI(title="Mi Recetario API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ORIGINS,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
-
-
-# ============================================================
 # SALUD DEL SERVIDOR
 # ============================================================
+
+@app.get("/")
+def root():
+    return {
+        "message": "Mi Recetario API está funcionando.",
+        "docs": "/docs"
+    }
+
 
 @app.get("/api/health")
 def health():
@@ -402,9 +477,12 @@ def health():
 # ============================================================
 
 @app.post("/api/auth/login")
-def login(data: Login, db: Session = Depends(db_session)):
+def login(
+    data: Login,
+    db: Session = Depends(db_session)
+):
     user = db.query(User).filter(
-        User.email == data.email.lower()
+        User.email == data.email.strip().lower()
     ).first()
 
     if (
@@ -434,22 +512,34 @@ def users(
     _: User = Depends(admin),
     db: Session = Depends(db_session)
 ):
-    return db.query(User).order_by(User.id.desc()).all()
+    return db.query(User).order_by(
+        User.id.desc()
+    ).all()
 
 
-@app.post("/api/users", response_model=UserOut, status_code=201)
+@app.post(
+    "/api/users",
+    response_model=UserOut,
+    status_code=201
+)
 def add_user(
     data: UserCreate,
     _: User = Depends(admin),
     db: Session = Depends(db_session)
 ):
-    email = data.email.lower()
+    email = data.email.strip().lower()
 
     if db.query(User).filter(User.email == email).first():
-        raise HTTPException(409, "Ese correo ya existe.")
+        raise HTTPException(
+            status_code=409,
+            detail="Ese correo ya existe."
+        )
 
     if data.role not in ("user", "admin"):
-        raise HTTPException(422, "Rol inválido.")
+        raise HTTPException(
+            status_code=422,
+            detail="Rol inválido."
+        )
 
     user = User(
         name=data.name,
@@ -475,7 +565,10 @@ def edit_user(
     user = db.get(User, uid)
 
     if not user:
-        raise HTTPException(404, "Usuario no encontrado.")
+        raise HTTPException(
+            status_code=404,
+            detail="Usuario no encontrado."
+        )
 
     changes = data.model_dump(exclude_unset=True)
 
@@ -485,7 +578,7 @@ def edit_user(
         user.password_hash = hasher.hash(password)
 
     if changes.get("email"):
-        email = str(changes["email"]).lower()
+        email = str(changes["email"]).strip().lower()
 
         duplicate = db.query(User).filter(
             User.email == email,
@@ -493,17 +586,23 @@ def edit_user(
         ).first()
 
         if duplicate:
-            raise HTTPException(409, "Correo ya registrado.")
+            raise HTTPException(
+                status_code=409,
+                detail="Correo ya registrado."
+            )
 
         changes["email"] = email
 
     if changes.get("role") not in (None, "user", "admin"):
-        raise HTTPException(422, "Rol inválido.")
+        raise HTTPException(
+            status_code=422,
+            detail="Rol inválido."
+        )
 
     if uid == a.id and changes.get("active") is False:
         raise HTTPException(
-            400,
-            "No puedes desactivar tu propia cuenta."
+            status_code=400,
+            detail="No puedes desactivar tu propia cuenta."
         )
 
     for key, value in changes.items():
@@ -524,12 +623,15 @@ def remove_user(
     user = db.get(User, uid)
 
     if not user:
-        raise HTTPException(404, "Usuario no encontrado.")
+        raise HTTPException(
+            status_code=404,
+            detail="Usuario no encontrado."
+        )
 
     if uid == a.id:
         raise HTTPException(
-            400,
-            "No puedes eliminar tu propia cuenta."
+            status_code=400,
+            detail="No puedes eliminar tu propia cuenta."
         )
 
     db.delete(user)
@@ -561,11 +663,18 @@ def recipes(
         )
 
     if category and category != "Todas":
-        query = query.filter(Recipe.category == category)
+        query = query.filter(
+            Recipe.category == category
+        )
 
-    results = query.order_by(Recipe.id.desc()).all()
+    results = query.order_by(
+        Recipe.id.desc()
+    ).all()
 
-    return [recipe_json(recipe) for recipe in results]
+    return [
+        recipe_json(recipe)
+        for recipe in results
+    ]
 
 
 @app.post("/api/recipes", status_code=201)
@@ -596,12 +705,15 @@ def edit_recipe(
     recipe = db.get(Recipe, rid)
 
     if not recipe:
-        raise HTTPException(404, "Receta no encontrada.")
+        raise HTTPException(
+            status_code=404,
+            detail="Receta no encontrada."
+        )
 
     if user.role != "admin" and recipe.created_by != user.id:
         raise HTTPException(
-            403,
-            "Solo puedes editar tus propias recetas."
+            status_code=403,
+            detail="Solo puedes editar tus propias recetas."
         )
 
     for key, value in data.model_dump().items():
@@ -622,12 +734,15 @@ def remove_recipe(
     recipe = db.get(Recipe, rid)
 
     if not recipe:
-        raise HTTPException(404, "Receta no encontrada.")
+        raise HTTPException(
+            status_code=404,
+            detail="Receta no encontrada."
+        )
 
     if user.role != "admin" and recipe.created_by != user.id:
         raise HTTPException(
-            403,
-            "Solo puedes eliminar tus propias recetas."
+            status_code=403,
+            detail="Solo puedes eliminar tus propias recetas."
         )
 
     db.delete(recipe)
