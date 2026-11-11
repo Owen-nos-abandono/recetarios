@@ -1,0 +1,1 @@
+import {HttpInterceptorFn} from '@angular/common/http';export const authInterceptor:HttpInterceptorFn=(req,next)=>{const t=localStorage.getItem('recetario_token');return next(t&&req.url.startsWith('/api')?req.clone({setHeaders:{Authorization:`Bearer ${t}`}}):req);};
