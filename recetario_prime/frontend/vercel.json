@@ -1,8 +1,7 @@
-
 {
   "version": 2,
   "buildCommand": "npm run build",
-  "outputDirectory": "dist/recetario",
+  "outputDirectory": "dist/recetario/browser",
   "rewrites": [
     {
       "source": "/(.*)",
