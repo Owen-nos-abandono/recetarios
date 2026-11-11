@@ -1,10 +1,11 @@
+
 {
   "name": "recetario-frontend",
   "version": "1.0.0",
   "private": true,
   "scripts": {
     "start": "ng serve --proxy-config proxy.conf.json",
-    "build": "ng build"
+    "build": "node ./node_modules/@angular/cli/bin/ng.js build"
   },
   "dependencies": {
     "@angular/animations": "^19.2.0",
